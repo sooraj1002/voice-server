@@ -79,13 +79,15 @@ async def websocket_endpoint(websocket: WebSocket):
     Voice session WebSocket.
 
     Protocol (client → server):
-      - binary frames: WebM/Opus audio chunks
-      - text frame:    {"type": "end_turn"}   — process buffered audio
-      - text frame:    {"type": "cancel"}      — discard buffer, go back to listening
+      - binary frames:  WebM/Opus audio chunks
+      - text:  {"type": "end_turn"}             — process buffered audio
+      - text:  {"type": "cancel"}               — discard buffer
+      - text:  {"type": "confirm_result", "confirmed": bool}  — reply to confirm_expense
 
     Protocol (server → client):
       - text:   {"type": "thinking"}
       - text:   {"type": "transcript", "text": "..."}
+      - text:   {"type": "confirm_expense", "details": {...}}  — awaits confirm_result
       - binary: WAV audio bytes (TTS)
       - text:   {"type": "done"}
       - text:   {"type": "tool_result", "tool": "add_expense"}
@@ -129,12 +131,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     await websocket.send_text(json.dumps({"type": "thinking"}))
 
+                    async def confirm_expense(display: dict) -> bool:
+                        await websocket.send_text(
+                            json.dumps({"type": "confirm_expense", "details": display})
+                        )
+                        # Wait for the client's confirm_result message
+                        # (ignore any stray audio frames that arrive in between)
+                        while True:
+                            reply = await websocket.receive()
+                            if "text" in reply and reply["text"]:
+                                reply_data = json.loads(reply["text"])
+                                if reply_data.get("type") == "confirm_result":
+                                    return bool(reply_data.get("confirmed", False))
+
                     try:
                         transcript, wav_bytes, action = await process_turn(
                             bytes(audio_buffer),
                             token,
                             conversation_history,
                             session_cache,
+                            confirm_callback=confirm_expense,
                         )
                         audio_buffer.clear()
 

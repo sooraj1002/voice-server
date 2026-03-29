@@ -156,64 +156,90 @@ async def _get_spending_summary(client, headers, args) -> tuple[str, None]:
     return f"You spent {total:,.2f} this {period}.", None
 
 
-async def _add_expense(client, headers, args, cache) -> tuple[str, dict]:
+async def prepare_add_expense(
+    args: dict, jwt: str, cache: dict
+) -> tuple[dict | None, dict | None, str | None]:
+    """
+    Resolve category/account IDs and build the expense payload without POSTing.
+
+    Returns (display, payload, error_message).
+    display  — human-readable dict shown to user for confirmation.
+    payload  — ready-to-POST dict for execute_prepared_expense.
+    error    — non-None if resolution failed.
+    """
+    headers = {"Authorization": f"Bearer {jwt}"}
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=15.0) as client:
+        if not cache.get("categories"):
+            resp = await client.get("/api/categories", headers=headers)
+            resp.raise_for_status()
+            cache["categories"] = resp.json().get("data", [])
+
+        if not cache.get("accounts"):
+            resp = await client.get("/api/accounts", headers=headers)
+            resp.raise_for_status()
+            cache["accounts"] = resp.json().get("data", [])
+
     amount = float(args["amount"])
     description = args.get("description", "")
-    category_name = args.get("category_name", "")
-    account_name = args.get("account_name", "")
     date_str = args.get("date", "")
-    tags = args.get("tags", [])
+    tags = args.get("tags", []) or ["misc"]
 
-    # Ensure we have fresh category/account data in cache
-    if not cache.get("categories"):
-        resp = await client.get("/api/categories", headers=headers)
-        resp.raise_for_status()
-        cache["categories"] = resp.json().get("data", [])
-
-    if not cache.get("accounts"):
-        resp = await client.get("/api/accounts", headers=headers)
-        resp.raise_for_status()
-        cache["accounts"] = resp.json().get("data", [])
-
-    # Fuzzy-match category
-    category = _fuzzy_match(cache["categories"], category_name)
+    category = _fuzzy_match(cache["categories"], args.get("category_name", ""))
     if not category and cache["categories"]:
         category = cache["categories"][0]
 
-    # Fuzzy-match account
-    account = _fuzzy_match(cache["accounts"], account_name)
+    account = _fuzzy_match(cache["accounts"], args.get("account_name", ""))
     if not account and cache["accounts"]:
         account = cache["accounts"][0]
 
     if not category:
-        return "No categories available. Please create a category first.", None
+        return None, None, "No categories available. Please create a category first."
     if not account:
-        return "No accounts available. Please create an account first.", None
+        return None, None, "No accounts available. Please create an account first."
 
-    # Resolve date
     if not date_str:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT12:00:00.000Z")
-    elif len(date_str) == 10:  # YYYY-MM-DD
+    elif len(date_str) == 10:
         date_str = f"{date_str}T12:00:00.000Z"
 
+    display = {
+        "amount": amount,
+        "description": description,
+        "categoryName": category["name"],
+        "accountName": account["name"],
+        "date": date_str[:10],  # YYYY-MM-DD for display
+        "tags": tags,
+    }
     payload = {
         "amount": amount,
         "categoryId": category["id"],
         "accountId": account["id"],
         "date": date_str,
         "description": description,
-        "tags": tags if tags else ["misc"],
+        "tags": tags,
     }
+    return display, payload, None
 
-    resp = await client.post("/api/expenses", headers=headers, json=payload)
-    resp.raise_for_status()
+
+async def execute_prepared_expense(payload: dict, jwt: str) -> tuple[str, dict]:
+    """POST a pre-prepared expense payload to the backend."""
+    headers = {"Authorization": f"Bearer {jwt}"}
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=15.0) as client:
+        resp = await client.post("/api/expenses", headers=headers, json=payload)
+        resp.raise_for_status()
 
     confirmation = (
-        f"Added {amount:,.0f} for {description} "
-        f"under {category['name']} from {account['name']}."
+        f"Added {payload['amount']:,.0f} for {payload['description']}."
     )
-    action = {"tool": "add_expense", "success": True}
-    return confirmation, action
+    return confirmation, {"tool": "add_expense", "success": True}
+
+
+async def _add_expense(client, headers, args, cache) -> tuple[str, dict]:
+    # Kept for non-confirmation path (other tools routing)
+    display, payload, error = await prepare_add_expense(args, cache.get("_jwt", ""), cache)
+    if error:
+        return error, None
+    return await execute_prepared_expense(payload, cache.get("_jwt", ""))
 
 
 def _fuzzy_match(items: list[dict], name: str) -> dict | None:

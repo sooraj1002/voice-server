@@ -4,11 +4,13 @@ Core voice pipeline: audio → STT → LLM (with tools) → TTS → audio.
 import logging
 import subprocess
 
+from typing import Awaitable, Callable
+
 import stt
 import tts
 import llm
 from llm import build_system_prompt
-from tools import TOOL_DEFINITIONS, execute_tool
+from tools import TOOL_DEFINITIONS, execute_tool, prepare_add_expense, execute_prepared_expense
 from model_manager import model_manager
 
 logger = logging.getLogger(__name__)
@@ -43,15 +45,17 @@ async def process_turn(
     jwt: str,
     conversation_history: list[dict],
     session_cache: dict,
+    confirm_callback: Callable[[dict], Awaitable[bool]] | None = None,
 ) -> tuple[str, bytes, dict | None]:
     """
     Process one voice turn.
 
+    confirm_callback: async (display: dict) -> bool
+        Called before executing add_expense. Return True to confirm, False to cancel.
+        If None, expenses are added without confirmation.
+
     Returns:
         (transcript, wav_bytes, action_event_or_None)
-        - transcript: what the user said
-        - wav_bytes: TTS audio to play back
-        - action_event: e.g. {"tool": "add_expense"} for frontend cache invalidation
     """
     # 1. Decode audio
     pcm_bytes = _decode_webm_to_pcm(audio_bytes)
@@ -94,9 +98,24 @@ async def process_turn(
         )
 
         for tc in result["tool_calls"]:
-            tool_result, action = await execute_tool(
-                tc["name"], tc["arguments"], jwt, session_cache
-            )
+            if tc["name"] == "add_expense" and confirm_callback is not None:
+                # Resolve the expense details first, then ask the user to confirm
+                display, payload, error = await prepare_add_expense(
+                    tc["arguments"], jwt, session_cache
+                )
+                if error:
+                    tool_result, action = error, None
+                else:
+                    confirmed = await confirm_callback(display)
+                    if confirmed:
+                        tool_result, action = await execute_prepared_expense(payload, jwt)
+                    else:
+                        tool_result, action = "User reviewed and cancelled the expense.", None
+            else:
+                tool_result, action = await execute_tool(
+                    tc["name"], tc["arguments"], jwt, session_cache
+                )
+
             if action:
                 last_action = action
             logger.info("Tool %s → %s", tc["name"], tool_result)
